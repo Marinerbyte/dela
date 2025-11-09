@@ -1,7 +1,5 @@
 websockets
 requests
 python-dotenv
-Pillow
-yt-dlp
-requests_toolbelt
 beautifulsoup4
+Flask
