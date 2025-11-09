@@ -1,5 +1,4 @@
 websockets
 requests
 python-dotenv
-beautifulsoup4
 Flask
