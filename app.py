@@ -1,4 +1,4 @@
-# = ===============================================================
+# ===============================================================
 # === 1. ZAROORI LIBRARIES & SETUP ===
 # ===============================================================
 import asyncio
@@ -9,38 +9,44 @@ import websockets
 import requests
 import os
 import threading
+import logging  # <<< Naya import behtar logging ke liye
 from flask import Flask
 from dotenv import load_dotenv
 
-# .env file se sirf API key lega
 load_dotenv()
 
 # ===============================================================
-# === 2. CONFIGURATION (HARCODED) ===
+# === 2. LOGGING SETUP ===
 # ===============================================================
-# --- BOT DETAILS (Aapke nirdesh anusaar hardcoded) ---
+# Saare print() ko is logger se replace karenge
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# ===============================================================
+# === 3. CONFIGURATION (HARCODED) ===
+# ===============================================================
 BOT_USERNAME = "delvina"
 BOT_PASSWORD = "p99665"
 INITIAL_ROOM = "game🥇-pvt"
 SOCKET_URL = "wss://chatp.net:5333/server"
 
-# --- AI CONFIG ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Sirf secret key .env se aayegi
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_MODEL_NAME = "llama-3.1-8b-instant"
 DEFAULT_PERSONALITY = "sweet"
 MEMORY_LIMIT = 20
 
 # ===============================================================
-# === 3. BOT KA "DIMAAG" (STATE MANAGEMENT) ===
+# === 4. BOT KA "DIMAAG" (STATE MANAGEMENT) ===
 # ===============================================================
-# Yeh global variables bot ke chalte rehne tak memory mein rahenge
 room_state = { "users": {}, "name": "" }
 conversation_memory = {}
 chat_personalities = {}
 
 # ===============================================================
-# === 4. AI PROMPTS & LOGIC ===
+# === 5. AI PROMPTS & LOGIC ===
 # ===============================================================
 CORE_PROMPT = "[RULE: Your replies MUST be very short, under 15 words.]\n[IDENTITY: You are 'Delvina', a smart and witty chat bot.]\nReply in the same language the user uses."
 PERSONAS = {
@@ -50,47 +56,37 @@ PERSONAS = {
 }
 
 def get_ai_response(room_name, user_message):
-    """Groq API ko seedhe requests library se call karta hai."""
     current_personality = chat_personalities.get(room_name, DEFAULT_PERSONALITY)
     prompt = PERSONAS[current_personality]["prompt"]
     history = conversation_memory.get(room_name, [])
-    
     messages_to_send = [{"role": "system", "content": prompt}, *history, {"role": "user", "content": user_message}]
-    
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": AI_MODEL_NAME, "messages": messages_to_send, "max_tokens": 80}
-    
     try:
         response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
         response.raise_for_status()
         reply = response.json()['choices'][0]['message']['content'].strip()
-        
         new_history = history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": reply}]
         conversation_memory[room_name] = new_history[-MEMORY_LIMIT*2:]
         return reply
     except Exception as e:
-        print(f"[!] Groq API error: {e}")
+        logging.error(f"Groq API error: {e}") # <<< Behtar error logging
         return "Oops, mera AI dimaag kaam nahi kar raha. 😒"
 
 # ===============================================================
-# === 5. BOT CORE LOGIC (WEBSOCKETS) ===
+# === 6. BOT CORE LOGIC (WEBSOCKETS) ===
 # ===============================================================
 def generate_random_id(length=20): return ''.join(random.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(length))
 def is_admin_or_higher(username): return room_state["users"].get(username, {}).get("role", "unknown") in ["admin", "owner", "creator"]
 
 async def send_message(ws, room_name, body):
-    payload = {
-        "handler": "room_message", "id": generate_random_id(), "room": room_name,
-        "type": "text", "body": body
-    }
+    payload = {"handler": "room_message", "id": generate_random_id(), "room": room_name, "type": "text", "body": body}
     await ws.send(json.dumps(payload))
 
 async def handle_message(ws, data):
     sender, message, room = data.get("from"), data.get("body", "").strip(), data.get("room")
     if sender == BOT_USERNAME or not message: return
-
-    print(f"[<<] '{room}' mein {sender} se: {message}")
-
+    logging.info(f"[MSG RECV] Room: '{room}', From: '{sender}', Msg: '{message}'")
     bot_mention = f"@{BOT_USERNAME}"
     if message.lower().startswith(bot_mention.lower()):
         prompt = message[len(bot_mention):].strip()
@@ -98,7 +94,6 @@ async def handle_message(ws, data):
             response = get_ai_response(room, prompt)
             await send_message(ws, room, response)
         return
-
     if message.startswith("!pers "):
         if is_admin_or_higher(sender):
             parts = message.split(' ', 1)
@@ -112,70 +107,60 @@ async def handle_message(ws, data):
             await send_message(ws, room, f"Maaf kijiye, yeh command sirf admins ke liye hai.")
 
 async def start_bot():
-    """Bot ka main connection aur message handling loop."""
-    print("[*] Bot ka websocket loop shuru ho raha hai...")
+    logging.info("Attempting to connect to websocket server...")
     async with websockets.connect(SOCKET_URL, ssl=True) as websocket:
-        print("[+] Server se connect ho gaya!")
+        logging.info("Websocket connection successful!")
         await websocket.send(json.dumps({"handler": "login", "id": generate_random_id(), "username": BOT_USERNAME, "password": BOT_PASSWORD}))
-        
         async for payload_str in websocket:
             try:
                 data = json.loads(payload_str)
                 event_type = data.get("type")
-
                 if event_type == "success" and data.get("handler") == "login_event":
-                    print("[+] Login safal!")
+                    logging.info("Login successful!")
                     await websocket.send(json.dumps({"handler": "room_join", "id": generate_random_id(), "name": INITIAL_ROOM}))
-                
                 elif event_type == "you_joined":
                     room_name = data.get("name")
-                    print(f"[*] Room '{room_name}' join kiya.")
+                    logging.info(f"Successfully joined room: '{room_name}'")
                     room_state["name"] = room_name
                     room_state["users"] = {user["username"]: {"role": user["role"]} for user in data.get("users", [])}
                     await send_message(websocket, room_name, f"Delvina AI online hai! Mujhse baat karne ke liye @{BOT_USERNAME} likhein.")
-                
                 elif data.get("handler") == "room_message" and event_type == "text":
                     await handle_message(websocket, data)
-            
             except Exception as e:
-                print(f"[!] Payload process karte waqt error: {e}")
+                logging.error(f"Error processing payload: {e}")
 
 # ===============================================================
-# === 6. FLASK WEB APP WRAPPER ===
+# === 7. FLASK WEB APP WRAPPER ===
 # ===============================================================
-# Yeh Flask App sirf Render.com jaise platform ko yeh batane ke liye hai ki
-# hamara program ek web service hai. Asli kaam background thread mein hota hai.
-
 app = Flask(__name__)
-
 @app.route('/')
-def index():
-    return "Delvina AI Bot is running!", 200
+def index(): return "Delvina AI Bot is running!", 200
 
 def run_bot_in_background():
-    """Bot ke reconnection loop ko hamesha chalata hai."""
-    print("--- Talkinchat AI Bot (Web App Version) Shuru ho raha hai ---")
+    logging.info("Starting bot's background thread...")
     while True:
         try:
+            logging.info("Starting a new bot session...")
             asyncio.run(start_bot())
         except websockets.exceptions.ConnectionClosed:
-            print("[!] Connection band ho gaya. 10 sec mein reconnect kar raha hai...")
+            logging.warning("Connection closed. Reconnecting in 10 seconds...")
         except Exception as e:
-            print(f"[!] Anjaan error: {e}. 10 sec mein restart kar raha hai...")
+            # `logging.exception` poora error trace dikhayega
+            logging.exception(f"An unexpected error occurred in bot thread: {e}")
+            logging.info("Restarting bot thread in 10 seconds...")
         time.sleep(10)
 
 # ===============================================================
-# === 7. MAIN EXECUTION BLOCK ===
+# === 8. MAIN EXECUTION BLOCK ===
 # ===============================================================
 if __name__ == "__main__":
     if not GROQ_API_KEY:
-        print("[!!!] CRITICAL: .env file mein GROQ_API_KEY set nahi hai!")
+        logging.critical("CRITICAL: GROQ_API_KEY is not set in the environment!")
     
-    # 1. Bot ko ek alag background thread mein shuru karna
     bot_thread = threading.Thread(target=run_bot_in_background)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # 2. Flask web server ko main thread mein shuru karna (taaki Render khush rahe)
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Flask ke default logger ko band kar dete hain taaki hamare logger se double-logging na ho
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
