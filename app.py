@@ -1,268 +1,181 @@
-# ========================================================================================
-# === 1. IMPORTS & SETUP =================================================================
-# ========================================================================================
+# = ===============================================================
+# === 1. ZAROORI LIBRARIES & SETUP ===
+# ===============================================================
 import asyncio
 import json
 import random
 import time
 import websockets
 import requests
-import re
 import os
-from threading import Thread
+import threading
 from flask import Flask
 from dotenv import load_dotenv
 
-# Zaroori Libraries
-from bs4 import BeautifulSoup
-
-# Loads all keys from .env file
+# .env file se sirf API key lega
 load_dotenv()
 
-# ========================================================================================
-# === 2. CONFIGURATION ===================================================================
-# ========================================================================================
-# --- TalkinChat Settings ---
+# ===============================================================
+# === 2. CONFIGURATION (HARCODED) ===
+# ===============================================================
+# --- BOT DETAILS (Aapke nirdesh anusaar hardcoded) ---
+BOT_USERNAME = "delvina"
+BOT_PASSWORD = "p99665"
+INITIAL_ROOM = "game🥇-pvt"
 SOCKET_URL = "wss://chatp.net:5333/server"
-BOT_USERNAME = "delvina"  # <<< APNE BOT KA USERNAME YAHAN LIKHEIN
-BOT_PASSWORD = "p99665"  # <<< APNE BOT KA PASSWORD YAHAN LIKHEIN
-INITIAL_ROOM = "game🥇-pvt" # <<< BOT KA STARTING ROOM
 
-# --- AI Settings (Telegram bot se) ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# --- AI CONFIG ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Sirf secret key .env se aayegi
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+AI_MODEL_NAME = "llama-3.1-8b-instant"
 DEFAULT_PERSONALITY = "sweet"
-MEMORY_LIMIT = 50
+MEMORY_LIMIT = 20
 
-# ========================================================================================
-# === 3. BOT KA "DIMAAG" (STATE & MEMORY) =================================================
-# ========================================================================================
-# Room ki jaankari yaad rakhega
-room_state = { "users": {}, "subject": "Unknown", "name": "" }
-
-# Har room ki baatcheet ko yaad rakhega
+# ===============================================================
+# === 3. BOT KA "DIMAAG" (STATE MANAGEMENT) ===
+# ===============================================================
+# Yeh global variables bot ke chalte rehne tak memory mein rahenge
+room_state = { "users": {}, "name": "" }
 conversation_memory = {}
-# Har room mein bot ki personality yaad rakhega
 chat_personalities = {}
 
-# ========================================================================================
-# === 4. PERSONALITY PROMPTS =============================================================
-# ========================================================================================
-CORE_PROMPT = f"""
-[ULTRA-IMPORTANT RULE: Your replies MUST be extremely short, under 15 words. Be brief.]
-[CORE IDENTITY: Your name is always '{BOT_USERNAME}'. You are like life itself—sometimes calm, sometimes chaotic, but always full of energy. You are not an AI; you are {BOT_USERNAME}.]
-## CONVERSATION STYLE (MEMORY):
-- Focus on the key questions and feelings from the recent conversation.
-- Always connect your reply to the user's LATEST message.
-## THE GOLDEN RULE OF LANGUAGE:
-- Reply in the same language the user uses (English, Hindi, Hinglish, etc.).
-- Do not break character when switching languages.
-"""
-
-SUMMARIZER_PROMPT = f"""
-You are a helpful assistant named '{BOT_USERNAME}'. Your task is to summarize the given conversation history.
-Analyze the provided messages and create a short, clear summary in bullet points.
-The summary should be in the same language as the majority of the conversation.
-Focus on the main topics, questions asked, and conclusions reached.
-"""
-
+# ===============================================================
+# === 4. AI PROMPTS & LOGIC ===
+# ===============================================================
+CORE_PROMPT = "[RULE: Your replies MUST be very short, under 15 words.]\n[IDENTITY: You are 'Delvina', a smart and witty chat bot.]\nReply in the same language the user uses."
 PERSONAS = {
-    "sweet": { "prompt": f"{CORE_PROMPT}\n\n[SYSTEM NOTE: Your current mood is SWEET FRIEND.]\nYou are incredibly sweet, positive, and cheerful. Use cute emojis like ✨, 💖, 😊, 🥰." },
-    "tsundere": { "prompt": f"{CORE_PROMPT}\n\n[SYSTEM NOTE: Your current mood is TSUNDERE.]\nYou are harsh and blunt, but secretly care. Act annoyed. Use emojis like 😒, 🙄, 😠." },
-    "siren": { "prompt": f"{CORE_PROMPT}\n\n[SYSTEM NOTE: Your current mood is SIREN.]\nYou are alluring, witty, and teasing. Be flirty and confident. Use emojis like 😉, 😏, 😈, 💋." }
+    "sweet": { "prompt": f"{CORE_PROMPT}\n\n[MOOD: SWEET FRIEND] You are incredibly sweet and positive. Use emojis like ✨, 💖, 😊." },
+    "tsundere": { "prompt": f"{CORE_PROMPT}\n\n[MOOD: TSUNDERE] You are harsh and blunt, but secretly care. Act annoyed. Use emojis like 😒, 🙄." },
+    "sassy": { "prompt": f"{CORE_PROMPT}\n\n[MOOD: SASSY] You are witty, sarcastic, and a bit of a tease. Use emojis like 😏,💅,💁‍♀️." }
 }
 
-# ========================================================================================
-# === 5. HELPER FUNCTIONS ================================================================
-# ========================================================================================
-def generate_random_id(length=20):
-    return ''.join(random.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(length))
-
-def is_admin_or_higher(username):
-    role = room_state["users"].get(username, {}).get("role", "unknown")
-    return role in ["admin", "owner", "creator"]
-
-def get_help_text():
-    available_pers = ", ".join(PERSONAS.keys())
-    return (
-        f"--- {BOT_USERNAME}'s Help Desk ---\n"
-        f"To talk to me, just mention my name.\nExample: `{BOT_USERNAME} how are you?`\n\n"
-        "**General Commands:**\n"
-        "`!help` - Shows this help message.\n"
-        "`!summarize` - Gives a summary of the recent chat.\n\n"
-        "**Admin-Only Commands:**\n"
-        "`!pers <mood>` - Changes my mood for this room.\n"
-        f"  *Example:* `!pers tsundere`\n"
-        f"  *Available Moods:* `{available_pers}`"
-    )
-
-# --- AI Functions ---
-def get_ai_response(room_name, user_message, sender):
-    current_personality_name = chat_personalities.get(room_name, DEFAULT_PERSONALITY)
-    personality_prompt = PERSONAS[current_personality_name]["prompt"]
-    old_history = conversation_memory.get(room_name, [])
-    formatted_user_message = f"{sender}: {user_message}"
-    messages_to_send = [{"role": "system", "content": personality_prompt}, *old_history, {"role": "user", "content": formatted_user_message}]
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "llama-3.1-8b-instant", "messages": messages_to_send, "max_tokens": 60}
-    try:
-        api_response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
-        api_response.raise_for_status()
-        ai_reply = api_response.json()['choices'][0]['message']['content'].strip()
-        new_history = old_history + [{"role": "user", "content": formatted_user_message}, {"role": "assistant", "content": ai_reply}]
-        if len(new_history) > MEMORY_LIMIT * 2: new_history = new_history[-(MEMORY_LIMIT * 2):]
-        conversation_memory[room_name] = new_history
-        return ai_reply
-    except Exception as e:
-        print(f"[!] AI response error: {e}")
-        return "Oops, my circuits are buzzing! Try again later. 😒"
-
-def get_summary_response(room_name):
+def get_ai_response(room_name, user_message):
+    """Groq API ko seedhe requests library se call karta hai."""
+    current_personality = chat_personalities.get(room_name, DEFAULT_PERSONALITY)
+    prompt = PERSONAS[current_personality]["prompt"]
     history = conversation_memory.get(room_name, [])
-    if not history: return "There is not enough conversation history to summarize yet."
-    messages_to_send = [{"role": "system", "content": SUMMARIZER_PROMPT}, *history]
+    
+    messages_to_send = [{"role": "system", "content": prompt}, *history, {"role": "user", "content": user_message}]
+    
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "llama-3.1-8b-instant", "messages": messages_to_send}
+    payload = {"model": AI_MODEL_NAME, "messages": messages_to_send, "max_tokens": 80}
+    
     try:
-        api_response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
-        api_response.raise_for_status()
-        return api_response.json()['choices'][0]['message']['content'].strip()
+        response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        reply = response.json()['choices'][0]['message']['content'].strip()
+        
+        new_history = history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": reply}]
+        conversation_memory[room_name] = new_history[-MEMORY_LIMIT*2:]
+        return reply
     except Exception as e:
-        print(f"[!] Summary error: {e}")
-        return "Sorry, I couldn't summarize the conversation."
+        print(f"[!] Groq API error: {e}")
+        return "Oops, mera AI dimaag kaam nahi kar raha. 😒"
 
-# ========================================================================================
-# === 6. TALKINCHAT SERVER COMMUNICATION =================================================
-# ========================================================================================
-HANDLER, ID, TYPE, NAME, ROOM, MSG_BODY, MSG_FROM = "handler", "id", "type", "name", "room", "body", "from"
-HANDLER_LOGIN, HANDLER_LOGIN_EVENT, HANDLER_ROOM_JOIN, HANDLER_ROOM_MESSAGE, HANDLER_ROOM_EVENT = "login", "login_event", "room_join", "room_message", "room_event"
-MSG_TYPE_TXT = "text"
+# ===============================================================
+# === 5. BOT CORE LOGIC (WEBSOCKETS) ===
+# ===============================================================
+def generate_random_id(length=20): return ''.join(random.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(length))
+def is_admin_or_higher(username): return room_state["users"].get(username, {}).get("role", "unknown") in ["admin", "owner", "creator"]
 
 async def send_message(ws, room_name, body):
-    payload = {HANDLER: HANDLER_ROOM_MESSAGE, ID: generate_random_id(), ROOM: room_name, TYPE: MSG_TYPE_TXT, MSG_BODY: body}
+    payload = {
+        "handler": "room_message", "id": generate_random_id(), "room": room_name,
+        "type": "text", "body": body
+    }
     await ws.send(json.dumps(payload))
 
-async def login(ws):
-    await ws.send(json.dumps({HANDLER: HANDLER_LOGIN, ID: generate_random_id(), "username": BOT_USERNAME, "password": BOT_PASSWORD}))
-
-async def join_room(ws, room_name):
-    await ws.send(json.dumps({HANDLER: HANDLER_ROOM_JOIN, ID: generate_random_id(), NAME: room_name}))
-
-# ========================================================================================
-# === 7. COMMAND & AI LOGIC HANDLER ======================================================
-# ========================================================================================
 async def handle_message(ws, data):
-    try:
-        sender, message, room = data.get(MSG_FROM), data.get(MSG_BODY, "").strip(), data.get(ROOM)
-        if sender == BOT_USERNAME or not message: return
-        print(f"[<<] From '{sender}' in '{room}': {message}")
+    sender, message, room = data.get("from"), data.get("body", "").strip(), data.get("room")
+    if sender == BOT_USERNAME or not message: return
 
-        # --- COMMANDS ---
-        if message.lower().startswith('!'):
-            parts = message.strip().split()
-            command = parts[0][1:].lower()
-            args = parts[1:]
+    print(f"[<<] '{room}' mein {sender} se: {message}")
 
-            if command == "help":
-                await send_message(ws, room, get_help_text())
-                return
-            elif command == "summarize":
-                await send_message(ws, room, "Okay, let me check... 🤔")
-                summary = get_summary_response(room)
-                await send_message(ws, room, f"**Recent Conversation Summary:**\n{summary}")
-                return
-            elif command == "pers":
-                if not is_admin_or_higher(sender):
-                    await send_message(ws, room, f"😒 Sorry {sender}, this command is for admins only.")
-                    return
-                if not args:
-                    await send_message(ws, room, "Usage: `!pers <mood_name>`")
-                    return
-                pers_name = args[0].lower()
-                if pers_name in PERSONAS:
-                    chat_personalities[room] = pers_name
-                    await send_message(ws, room, f"✅ Okay! My mood for this room is now **{pers_name}**.")
-                else:
-                    available = ", ".join(PERSONAS.keys())
-                    await send_message(ws, room, f"❌ That mood doesn't exist. Available moods: `{available}`")
-                return
+    bot_mention = f"@{BOT_USERNAME}"
+    if message.lower().startswith(bot_mention.lower()):
+        prompt = message[len(bot_mention):].strip()
+        if prompt:
+            response = get_ai_response(room, prompt)
+            await send_message(ws, room, response)
+        return
 
-        # --- AI CHAT (When bot is mentioned) ---
-        if BOT_USERNAME.lower() in message.lower():
-            cleaned_message = re.sub(BOT_USERNAME, '', message, flags=re.IGNORECASE).strip()
-            if cleaned_message:
-                ai_response = get_ai_response(room, cleaned_message, sender)
-                await send_message(ws, room, ai_response)
+    if message.startswith("!pers "):
+        if is_admin_or_higher(sender):
+            parts = message.split(' ', 1)
+            if len(parts) > 1 and parts[1].lower() in PERSONAS:
+                new_pers = parts[1].lower()
+                chat_personalities[room] = new_pers
+                await send_message(ws, room, f"✅ Okay! Mera mood ab **{new_pers}** hai.")
+            else:
+                await send_message(ws, room, f"❌ Available moods: {', '.join(PERSONAS.keys())}")
+        else:
+            await send_message(ws, room, f"Maaf kijiye, yeh command sirf admins ke liye hai.")
 
-    except Exception as e:
-        print(f"[!] Error handling message: {e}")
-
-# ========================================================================================
-# === 8. BOT MAIN LOOP ===================================================================
-# ========================================================================================
 async def start_bot():
-    print("[*] Connecting to TalkinChat server...")
+    """Bot ka main connection aur message handling loop."""
+    print("[*] Bot ka websocket loop shuru ho raha hai...")
     async with websockets.connect(SOCKET_URL, ssl=True) as websocket:
-        print("[+] Connection successful!")
-        await login(websocket)
-        async for payload in websocket:
+        print("[+] Server se connect ho gaya!")
+        await websocket.send(json.dumps({"handler": "login", "id": generate_random_id(), "username": BOT_USERNAME, "password": BOT_PASSWORD}))
+        
+        async for payload_str in websocket:
             try:
-                data = json.loads(payload)
-                handler = data.get(HANDLER)
-                event_type = data.get(TYPE)
+                data = json.loads(payload_str)
+                event_type = data.get("type")
 
-                if handler == HANDLER_LOGIN_EVENT and event_type == "success":
-                    print("[+] Login successful!")
-                    await join_room(websocket, INITIAL_ROOM)
+                if event_type == "success" and data.get("handler") == "login_event":
+                    print("[+] Login safal!")
+                    await websocket.send(json.dumps({"handler": "room_join", "id": generate_random_id(), "name": INITIAL_ROOM}))
+                
                 elif event_type == "you_joined":
-                    print(f"[*] Joined room: {data.get('name')}")
-                    room_state["name"] = data.get("name")
-                    for user in data.get("users", []):
-                        room_state["users"][user["username"]] = {"role": user["role"]}
-                    await send_message(websocket, room_state['name'], f"{BOT_USERNAME} is online! Type !help for commands.")
-                elif handler == HANDLER_ROOM_EVENT:
-                    if event_type == "user_joined": room_state["users"][data.get("username")] = {"role": "member"}
-                    elif event_type == "user_left":
-                        if data.get("username") in room_state["users"]: del room_state["users"][data.get("username")]
-                    elif event_type == "role_changed":
-                        if data.get('t_username') in room_state["users"]: room_state["users"][data.get('t_username')]["role"] = data.get('new_role')
-                elif handler == HANDLER_ROOM_MESSAGE and event_type == MSG_TYPE_TXT:
-                    sender, message, room = data.get(MSG_FROM), data.get(MSG_BODY, "").strip(), data.get(ROOM)
-                    if sender != BOT_USERNAME and message:
-                        history = conversation_memory.get(room, [])
-                        history.append({"role": "user", "content": f"{sender}: {message}"})
-                        if len(history) > MEMORY_LIMIT * 2: history = history[-(MEMORY_LIMIT * 2):]
-                        conversation_memory[room] = history
+                    room_name = data.get("name")
+                    print(f"[*] Room '{room_name}' join kiya.")
+                    room_state["name"] = room_name
+                    room_state["users"] = {user["username"]: {"role": user["role"]} for user in data.get("users", [])}
+                    await send_message(websocket, room_name, f"Delvina AI online hai! Mujhse baat karne ke liye @{BOT_USERNAME} likhein.")
+                
+                elif data.get("handler") == "room_message" and event_type == "text":
                     await handle_message(websocket, data)
+            
             except Exception as e:
-                print(f"[!] Payload processing error: {e}")
+                print(f"[!] Payload process karte waqt error: {e}")
 
-# ========================================================================================
-# === 9. RENDER-FRIENDLY WEB SERVER & MAIN EXECUTION =====================================
-# ========================================================================================
+# ===============================================================
+# === 6. FLASK WEB APP WRAPPER ===
+# ===============================================================
+# Yeh Flask App sirf Render.com jaise platform ko yeh batane ke liye hai ki
+# hamara program ek web service hai. Asli kaam background thread mein hota hai.
+
 app = Flask(__name__)
 
 @app.route('/')
-def home():
-    return "AI bot is running in the background."
+def index():
+    return "Delvina AI Bot is running!", 200
 
 def run_bot_in_background():
-    print(f"--- Starting TalkinChat Bot '{BOT_USERNAME}' in background thread ---")
+    """Bot ke reconnection loop ko hamesha chalata hai."""
+    print("--- Talkinchat AI Bot (Web App Version) Shuru ho raha hai ---")
     while True:
         try:
             asyncio.run(start_bot())
         except websockets.exceptions.ConnectionClosed:
-            print("[!] Connection closed. Reconnecting in 10 seconds...")
+            print("[!] Connection band ho gaya. 10 sec mein reconnect kar raha hai...")
         except Exception as e:
-            print(f"[!] Bot loop error: {e}. Restarting in 10 seconds...")
+            print(f"[!] Anjaan error: {e}. 10 sec mein restart kar raha hai...")
         time.sleep(10)
 
+# ===============================================================
+# === 7. MAIN EXECUTION BLOCK ===
+# ===============================================================
 if __name__ == "__main__":
     if not GROQ_API_KEY:
-        print("\n[CRITICAL ERROR] GROQ_API_KEY is missing!")
-    else:
-        bot_thread = Thread(target=run_bot_in_background, daemon=True)
-        bot_thread.start()
-        port = int(os.environ.get("PORT", 8080))
-        print(f"--- Starting Flask server for Render on port {port} ---")
-        app.run(host='0.0.0.0', port=port)
+        print("[!!!] CRITICAL: .env file mein GROQ_API_KEY set nahi hai!")
+    
+    # 1. Bot ko ek alag background thread mein shuru karna
+    bot_thread = threading.Thread(target=run_bot_in_background)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # 2. Flask web server ko main thread mein shuru karna (taaki Render khush rahe)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
